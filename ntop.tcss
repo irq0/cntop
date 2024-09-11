@@ -1,0 +1,11 @@
+#log {
+     dock: bottom;
+     height: 6;
+     border: heavy gray;
+     padding: 1;
+     margin: 1;
+}
+
+#main {
+     padding: 1;
+}
