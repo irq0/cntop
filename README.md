@@ -4,6 +4,7 @@ A (n)top-like tool to show Ceph "dump_messenger" network information.
 
 <img width="1736" alt="Screenshot 2024-09-13 at 13 46 28" src="https://github.com/user-attachments/assets/e4903e72-8437-462d-8b26-0f3e6df6cae3">
 
+Requires https://github.com/irq0/ceph/tree/wip/osd-asok-messenger-dump
 
 ## Usage
 
