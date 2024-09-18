@@ -216,11 +216,18 @@ class ConstatTable(Widget):
     ]
 
     # ("header", tags for selected column viewing
+    # Note: Ensure sort columns are available in every tag view
     columns = [
         ("Messenger", ("tcpi", "addr")),
         ("Conn#", ("tcpi", "addr")),
-        ("FD", ("tcpi",)),
-        ("Worker", ()),
+        (
+            "FD",
+            (
+                "tcpi",
+                "addr",
+            ),
+        ),
+        ("Worker", ("tcpi", "addr")),
         ("State", ()),
         ("Connected", ()),
         ("Peer: Entity", ()),
