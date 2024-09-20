@@ -181,13 +181,36 @@ def get_tcpi_description(k: str) -> str:
     }.get(k, "")
 
 
-def dump_messenger(cluster: rados.Rados, target: CephTarget) -> Dict[str, Any]:
-    ret, outbuf, outs = json_command(cluster, target=target, prefix="dump_messenger")
+def discover_messengers(cluster: rados.Rados, target: CephTarget) -> List[str]:
+    ret, outbuf, outs = json_command(cluster, target=target, prefix="help")
+    help = json.loads(outbuf)
+    if ret in (0, 1):
+        return [
+            command.split()[2]
+            for command in help.keys()
+            if command.startswith("messenger dump")
+        ]
+    return []
+
+
+def dump_messenger(cluster: rados.Rados, target: CephTarget, msgr: str) -> Any:
+    ret, outbuf, outs = json_command(
+        cluster, target=target, prefix=f"messenger dump {msgr}"
+    )
     if ret in (0, 1):
         return json.loads(outbuf)["messenger"]
     else:
         LOG.warning("Failed to call dump_messenger on %s (%d): %s", target, ret, outs)
         return {}
+
+
+def dump_messengers(
+    cluster: rados.Rados, target: CephTarget, msgrs: List[str]
+) -> Dict[str, Any]:
+    result = {}
+    for msgr in msgrs:
+        result.update(dump_messenger(cluster, target, msgr))
+    return result
 
 
 def pick_tcp_info(ti: Dict) -> List[str]:
@@ -246,6 +269,7 @@ class ConstatTable(Widget):
         self.show_tag = "all"
         self.sort_order = "default"
         self.data: Optional[Dict[str, Any]]
+        self.messengers = []
 
     @property
     def target(self) -> Optional[CephTarget]:
@@ -311,14 +335,17 @@ class ConstatTable(Widget):
     def refresh_data(self):
         if not self.table.columns or not self.target:
             return
-        self.data = dump_messenger(self.cluster, self.target)
+        self.messengers = discover_messengers(self.cluster, self.target)
+        self.data = dump_messengers(self.cluster, self.target, self.messengers)
+        LOG.info(self.messengers)
 
     def refresh_table(self) -> None:
         if not self.table.columns or not self.target:
             return
         self.table.clear()
         self.rebuild_columns()
-        self.data = dump_messenger(self.cluster, self.target)
+        self.messengers = discover_messengers(self.cluster, self.target)
+        self.data = dump_messengers(self.cluster, self.target, self.messengers)
         for name, m in self.data.items():
             for addr_con in m["connections"]:
                 c = addr_con["async_connection"]
