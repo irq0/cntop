@@ -158,6 +158,28 @@ def format_ceph_target(t: Optional[CephTarget]) -> str:
         return "?.?"
 
 
+def format_con_crypto(c) -> str:
+    if "v2" in c["protocol"]:
+        c = c["protocol"]["v2"]["crypto"]
+        if c["rx"] == c["tx"]:
+            return c["rx"]
+        else:
+            return "p['rx']/p['tx']"
+    else:
+        return "-"
+
+
+def format_con_compression(c) -> str:
+    if "v2" in c["protocol"]:
+        c = c["protocol"]["v2"]["compression"]
+        if c["rx"] == c["tx"]:
+            return c["rx"]
+        else:
+            return "p['rx']/p['tx']"
+    else:
+        return "-"
+
+
 def get_tcpi_description(k: str) -> str:
     return {
         "tcpi_retransmits": "current retransmits",
@@ -231,8 +253,9 @@ class ConstatTable(Widget):
 
     BINDINGS = [
         ("a", "columns('all')", "all columns"),
-        ("t", "columns('tcpi')", "tcpi only"),
-        ("d", "columns('addr')", "addresses only"),
+        ("t", "columns('tcpi')", "tcpi columns"),
+        ("d", "columns('addr')", "address columns"),
+        ("p", "columns('type')", "type columns"),
         ("S", "sort('default')", "Sort by Msgr, Conn#"),
         ("F", "sort('fd')", "Sort by FD"),
         ("W", "sort('worker')", "Sort by Worker"),
@@ -241,21 +264,25 @@ class ConstatTable(Widget):
     # ("header", tags for selected column viewing
     # Note: Ensure sort columns are available in every tag view
     columns = [
-        ("Messenger", ("tcpi", "addr")),
-        ("Conn#", ("tcpi", "addr")),
+        ("Messenger", ("tcpi", "addr", "type")),
+        ("Conn#", ("tcpi", "addr", "type")),
         (
             "FD",
             (
                 "tcpi",
                 "addr",
+                "type",
             ),
         ),
-        ("Worker", ("tcpi", "addr")),
+        ("Worker", ("tcpi", "addr", "type")),
         ("State", ()),
         ("Connected", ()),
         ("Peer: Entity", ()),
-        ("Type", ()),
-        ("GID", ()),
+        ("Type", ("type")),
+        ("Crypto", ("type")),
+        ("Compression", ("type")),
+        ("Mode", ("type")),
+        ("GID", ("type")),
         ("↔", ()),
         ("Local", ("addr",)),
         ("Remote", ("addr",)),
@@ -312,6 +339,9 @@ class ConstatTable(Widget):
             "✔" if c["status"]["connected"] else "𐄂",
             c["peer"]["entity_name"],
             c["peer"]["type"],
+            format_con_crypto(c),
+            format_con_compression(c),
+            next(iter(c["protocol"].values()))["con_mode"],
             (
                 f"{c['peer']['global_id']}/{c['peer']['id']}"
                 if c["peer"]["id"] != -1
