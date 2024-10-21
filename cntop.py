@@ -204,25 +204,28 @@ def get_tcpi_description(k: str) -> str:
 
 
 def discover_messengers(cluster: rados.Rados, target: CephTarget) -> List[str]:
-    ret, outbuf, outs = json_command(cluster, target=target, prefix="help")
-    help = json.loads(outbuf)
+    ret, outbuf, outs = json_command(cluster, target=target, prefix="messenger dump")
     if ret in (0, 1):
-        return [
-            command.split()[2]
-            for command in help.keys()
-            if command.startswith("messenger dump")
-        ]
-    return []
+
+        return json.loads(outbuf)["messengers"]
+    else:
+        LOG.warning(
+            "Failed to call messenger dump (list) on %s (%d): %s", target, ret, outs
+        )
+        return []
 
 
 def dump_messenger(cluster: rados.Rados, target: CephTarget, msgr: str) -> Any:
     ret, outbuf, outs = json_command(
-        cluster, target=target, prefix=f"messenger dump {msgr}"
+        cluster,
+        target=target,
+        prefix="messenger dump",
+        argdict={"msgr": msgr, "dumpcontents:all": True, "tcp_info": True},
     )
     if ret in (0, 1):
         return json.loads(outbuf)["messenger"]
     else:
-        LOG.warning("Failed to call dump_messenger on %s (%d): %s", target, ret, outs)
+        LOG.warning("Failed to call messenger dump on %s (%d): %s", target, ret, outs)
         return {}
 
 
