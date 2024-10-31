@@ -340,7 +340,7 @@ class ConstatTable(Widget):
             str(c["worker_id"]),
             c["state"].replace("STATE_", ""),
             "✔" if c["status"]["connected"] else "𐄂",
-            c["peer"]["entity_name"],
+            c["peer"]["entity_name"]["id"],
             c["peer"]["type"],
             format_con_crypto(c),
             format_con_compression(c),
