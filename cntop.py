@@ -234,7 +234,7 @@ def dump_messengers(
 ) -> Dict[str, Any]:
     result = {}
     for msgr in msgrs:
-        result.update(dump_messenger(cluster, target, msgr))
+        result[msgr] = dump_messenger(cluster, target, msgr)
     return result
 
 
