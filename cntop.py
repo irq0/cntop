@@ -207,7 +207,6 @@ def get_tcpi_description(k: str) -> str:
 def discover_messengers(cluster: rados.Rados, target: CephTarget) -> list[str]:
     ret, outbuf, outs = json_command(cluster, target=target, prefix="messenger dump")
     if ret in (0, 1):
-
         return json.loads(outbuf)["messengers"]
     else:
         LOG.warning(
