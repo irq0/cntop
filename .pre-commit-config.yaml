@@ -1,12 +1,12 @@
 repos:
   - repo: https://github.com/ambv/black
-    rev: 24.8.0
+    rev: 25.1.0
     hooks:
       - id: black
         language_version: python3.13
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v5.0.0
     hooks:
       - id: trailing-whitespace
       - id: check-yaml
@@ -28,13 +28,13 @@ repos:
       - id: check-vcs-permalinks
       - id: mixed-line-ending
   - repo: https://github.com/asottile/pyupgrade
-    rev: v3.17.0
+    rev: v3.19.1
     hooks:
       - id: pyupgrade
         args: [--py313-plus]
 
   - repo: https://github.com/pycqa/isort
-    rev: "5.13.2"
+    rev: "6.0.1"
     hooks:
       - id: isort
         name: isort (python)
@@ -42,7 +42,7 @@ repos:
         args: ["--profile", "black", "--filter-files"]
 
   - repo: https://github.com/hadialqattan/pycln # removes unused imports
-    rev: v2.4.0
+    rev: v2.5.0
     hooks:
       - id: pycln
         language_version: "3.13"
@@ -53,13 +53,8 @@ repos:
     hooks:
       - id: absolufy-imports
 
-  - repo: https://github.com/pre-commit/mirrors-autopep8
-    rev: v2.0.4
-    hooks:
-      - id: autopep8
-
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.4
+    rev: v0.10.0
     hooks:
       - id: ruff
         args: [--fix]
@@ -71,12 +66,12 @@ repos:
       - id: git-check
 
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.3.0
+    rev: v2.4.1
     hooks:
       - id: codespell
 
   - repo: https://github.com/pycqa/flake8
-    rev: 7.1.1
+    rev: 7.1.2
     hooks:
       - id: flake8
         additional_dependencies:

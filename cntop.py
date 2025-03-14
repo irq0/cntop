@@ -3,8 +3,9 @@ import json
 import logging
 import os
 from collections import namedtuple
+from collections.abc import Callable
 from datetime import timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 import rados
 import rich.box
@@ -32,7 +33,7 @@ from textual.widgets import (
     Static,
 )
 
-CephTarget = Tuple[str, Optional[str]]
+CephTarget = tuple[str, Optional[str]]
 
 LOG = logging.getLogger("cntop")
 
@@ -55,7 +56,7 @@ def connect() -> rados.Rados:
     return cluster
 
 
-def get_inventory(cluster: rados.Rados) -> Dict[str, List[CephTarget]]:
+def get_inventory(cluster: rados.Rados) -> dict[str, list[CephTarget]]:
     """
     Get Ceph cluster inventory as dict of type -> [target, ...]
     """
@@ -87,7 +88,7 @@ def get_inventory(cluster: rados.Rados) -> Dict[str, List[CephTarget]]:
     }
 
 
-def ceph_status_kv(cluster: rados.Rados) -> Dict[str, str]:
+def ceph_status_kv(cluster: rados.Rados) -> dict[str, str]:
     """Ceph status as key value pairs. Human readable keys"""
     return {
         "ID": json_command(cluster, prefix="fsid")[1].decode("utf-8").strip(),
@@ -96,7 +97,7 @@ def ceph_status_kv(cluster: rados.Rados) -> Dict[str, str]:
     }
 
 
-def format_socket_addr(socket_addr: Dict[str, Any]) -> str:
+def format_socket_addr(socket_addr: dict[str, Any]) -> str:
     if socket_addr["type"] == "none":
         return "∅"
     elif socket_addr["type"] == "any":
@@ -119,7 +120,7 @@ def format_timedelta_compact(d: timedelta) -> str:
         return f"{total_sec * 1e6:.0f} µs"
 
 
-def format_connection_type(m: Dict, c: Dict) -> str:
+def format_connection_type(m: dict, c: dict) -> str:
     if c["socket_addr"] in m["my_addrs"]["addrvec"]:
         return "IN"
     else:
@@ -151,7 +152,7 @@ def format_tcpi_value(k: str, v: int) -> str:
         return str(v)
 
 
-def format_ceph_target(t: Optional[CephTarget]) -> str:
+def format_ceph_target(t: CephTarget | None) -> str:
     if t:
         return f"{t[0]}.{t[1]}"
     else:
@@ -203,7 +204,7 @@ def get_tcpi_description(k: str) -> str:
     }.get(k, "")
 
 
-def discover_messengers(cluster: rados.Rados, target: CephTarget) -> List[str]:
+def discover_messengers(cluster: rados.Rados, target: CephTarget) -> list[str]:
     ret, outbuf, outs = json_command(cluster, target=target, prefix="messenger dump")
     if ret in (0, 1):
 
@@ -230,15 +231,15 @@ def dump_messenger(cluster: rados.Rados, target: CephTarget, msgr: str) -> Any:
 
 
 def dump_messengers(
-    cluster: rados.Rados, target: CephTarget, msgrs: List[str]
-) -> Dict[str, Any]:
+    cluster: rados.Rados, target: CephTarget, msgrs: list[str]
+) -> dict[str, Any]:
     result = {}
     for msgr in msgrs:
         result[msgr] = dump_messenger(cluster, target, msgr)
     return result
 
 
-def pick_tcp_info(ti: Dict) -> List[str]:
+def pick_tcp_info(ti: dict) -> list[str]:
     if ti:
         result = [ti[k] for k in TCP_INFO_KEYS]
         for i, k in enumerate(TCP_INFO_KEYS):
@@ -292,17 +293,17 @@ class ConstatTable(Widget):
         ("Last Active", ()),
     ] + [(format_tcpi_key(k), ("tcpi",)) for k in TCP_INFO_KEYS]
 
-    def __init__(self, cluster: rados.Rados, target: Optional[CephTarget], **kwargs):
+    def __init__(self, cluster: rados.Rados, target: CephTarget | None, **kwargs):
         super().__init__(**kwargs)
         self.cluster: rados.Rados = cluster
-        self._target: Optional[CephTarget] = target
+        self._target: CephTarget | None = target
         self.show_tag = "all"
         self.sort_order = "default"
-        self.data: Optional[Dict[str, Any]]
+        self.data: dict[str, Any] | None
         self.messengers = []
 
     @property
-    def target(self) -> Optional[CephTarget]:
+    def target(self) -> CephTarget | None:
         return self._target
 
     @target.setter
@@ -332,7 +333,7 @@ class ConstatTable(Widget):
         data = json.loads(raw)
         return ConstatRowKey(target=data[0], msgr_name=data[1], conn_id=data[2])
 
-    def add_con_row(self, msgr_name: str, m: Dict, c: Dict) -> None:
+    def add_con_row(self, msgr_name: str, m: dict, c: dict) -> None:
         all_col_row_data = [
             msgr_name,
             str(c["conn_id"]),
@@ -439,7 +440,7 @@ class DetailsScreen(ModalScreen):
         target: CephTarget,
         msgr_name: str,
         con_id: int,
-        get_messenger_data: Callable[[], Optional[Dict[str, Any]]],
+        get_messenger_data: Callable[[], dict[str, Any] | None],
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -488,7 +489,7 @@ class DetailsScreen(ModalScreen):
             Panel(self._listens_table(m), title="Listen"),
         )
 
-    def get_con_data(self) -> Optional[Dict]:
+    def get_con_data(self) -> dict | None:
         if not self.messenger_data:
             return None
         try:
