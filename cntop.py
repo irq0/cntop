@@ -5,11 +5,10 @@ import os
 from collections import namedtuple
 from collections.abc import Callable
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, Literal
 
 import rados
 import rich.box
-from ceph_argparse import json_command
 from rich.console import Group
 from rich.logging import RichHandler
 from rich.panel import Panel
@@ -33,7 +32,10 @@ from textual.widgets import (
     Static,
 )
 
-CephTarget = tuple[str, Optional[str]]
+CephOSDTarget = tuple[Literal["osd"], int]
+CephMonTarget = tuple[Literal["mon"], str]
+CephMgrTarget = tuple[Literal["mgr"], str]
+CephTarget = CephOSDTarget | CephMonTarget | CephMgrTarget
 
 LOG = logging.getLogger("cntop")
 
@@ -56,34 +58,61 @@ def connect() -> rados.Rados:
     return cluster
 
 
+CEPH_COMMAND_TIMEOUT_SECONDS = 0
+
+
+def target_command(target: CephTarget, cluster: rados.Rados, cmd: str):
+    match target:
+        case ("osd", osdid):
+            ret, outs, outbuf = cluster.osd_command(
+                osdid=osdid, cmd=cmd, inbuf=b"", timeout=CEPH_COMMAND_TIMEOUT_SECONDS
+            )
+        case ("mon", monid):
+            ret, outs, outbuf = cluster.mon_command(
+                cmd=cmd, inbuf=b"", timeout=CEPH_COMMAND_TIMEOUT_SECONDS, target=monid
+            )
+        case ("mgr", mgr):
+            ret, outs, outbuf = cluster.mgr_command(
+                cmd=cmd, inbuf=b"", timeout=CEPH_COMMAND_TIMEOUT_SECONDS, target=mgr
+            )
+    if ret in (0, 1):
+        return outs, outbuf
+    LOG.warning("json_command to %s failed", target)
+    raise RuntimeWarning(f'Ceph command "{cmd}" failed with {ret}: {outs}')
+
+
+def command_outs(
+    cluster: rados.Rados, target: CephTarget = ("mon", ""), **kwargs
+) -> str:
+    outs, _ = target_command(target, cluster, json.dumps(kwargs))
+    return outs.decode("utf-8").strip()
+
+
+def command_json(
+    cluster: rados.Rados, target: CephTarget = ("mon", ""), **kwargs
+) -> Any:
+    kwargs["format"] = "json"
+    outs, _ = target_command(target, cluster, json.dumps(kwargs))
+    return json.loads(outs.decode("utf-8"))
+
+
+def command_lines(
+    cluster: rados.Rados, target: CephTarget = ("mon", ""), **kwargs
+) -> list[str]:
+    outs, _ = target_command(target, cluster, json.dumps(kwargs))
+    return [line.decode("utf-8") for line in outs.split(b"\n") if line]
+
+
 def get_inventory(cluster: rados.Rados) -> dict[str, list[CephTarget]]:
     """
     Get Ceph cluster inventory as dict of type -> [target, ...]
     """
     return {
-        "osd": [
-            ("osd", line.decode("utf-8"))
-            for line in json_command(cluster, prefix="osd ls")[1].split(b"\n")
-            if line
-        ],
+        "osd": [("osd", int(osd)) for osd in command_lines(cluster, prefix="osd ls")],
         "mon": [
-            ("mon", m["name"])
-            for m in json.loads(
-                json_command(cluster, prefix="mon dump", argdict={"format": "json"})[
-                    1
-                ].decode("utf-8")
-            )["mons"]
+            ("mon", m["name"]) for m in command_json(cluster, prefix="mon dump")["mons"]
         ],
-        "mgr": [
-            (
-                "mgr",
-                json.loads(
-                    json_command(
-                        cluster, prefix="mgr dump", argdict={"format": "json"}
-                    )[1].decode("utf-8")
-                )["active_name"],
-            )
-        ],
+        "mgr": [("mgr", command_json(cluster, prefix="mgr dump")["active_name"])],
         # TODO add mds
     }
 
@@ -91,9 +120,9 @@ def get_inventory(cluster: rados.Rados) -> dict[str, list[CephTarget]]:
 def ceph_status_kv(cluster: rados.Rados) -> dict[str, str]:
     """Ceph status as key value pairs. Human readable keys"""
     return {
-        "ID": json_command(cluster, prefix="fsid")[1].decode("utf-8").strip(),
-        "Health": json_command(cluster, prefix="health")[1].decode("utf-8").strip(),
-        "": json_command(cluster, prefix="osd stat")[1].decode("utf-8").strip(),
+        "ID": command_outs(cluster, prefix="fsid"),
+        "Health": command_outs(cluster, prefix="health"),
+        "": command_outs(cluster, prefix="osd stat"),
     }
 
 
@@ -205,28 +234,18 @@ def get_tcpi_description(k: str) -> str:
 
 
 def discover_messengers(cluster: rados.Rados, target: CephTarget) -> list[str]:
-    ret, outbuf, outs = json_command(cluster, target=target, prefix="messenger dump")
-    if ret in (0, 1):
-        return json.loads(outbuf)["messengers"]
-    else:
-        LOG.warning(
-            "Failed to call messenger dump (list) on %s (%d): %s", target, ret, outs
-        )
-        return []
+    return command_json(cluster, target, prefix="messenger dump")["messengers"]
 
 
 def dump_messenger(cluster: rados.Rados, target: CephTarget, msgr: str) -> Any:
-    ret, outbuf, outs = json_command(
+    return command_json(
         cluster,
         target=target,
         prefix="messenger dump",
-        argdict={"msgr": msgr, "dumpcontents:all": True, "tcp_info": True},
-    )
-    if ret in (0, 1):
-        return json.loads(outbuf)["messenger"]
-    else:
-        LOG.warning("Failed to call messenger dump on %s (%d): %s", target, ret, outs)
-        return {}
+        msgr=msgr,
+        tcp_info=True,
+        **{"dumpcontents:all": True},
+    )["messenger"]
 
 
 def dump_messengers(
