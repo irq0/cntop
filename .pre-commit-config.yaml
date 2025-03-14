@@ -3,7 +3,7 @@ repos:
     rev: 24.8.0
     hooks:
       - id: black
-        language_version: python3.12
+        language_version: python3.13
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
@@ -31,21 +31,21 @@ repos:
     rev: v3.17.0
     hooks:
       - id: pyupgrade
-        args: [--py38-plus]
+        args: [--py313-plus]
 
   - repo: https://github.com/pycqa/isort
     rev: "5.13.2"
     hooks:
       - id: isort
         name: isort (python)
-        language_version: "3.12"
+        language_version: "3.13"
         args: ["--profile", "black", "--filter-files"]
 
   - repo: https://github.com/hadialqattan/pycln # removes unused imports
     rev: v2.4.0
     hooks:
       - id: pycln
-        language_version: "3.12"
+        language_version: "3.13"
         args: [--all]
 
   - repo: https://github.com/MarcoGorelli/absolufy-imports
@@ -83,3 +83,8 @@ repos:
           - flake8-bugbear
           - flake8-comprehensions
           - flake8-simplify
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.6.6
+    hooks:
+      - id: uv-lock
+      - id: uv-export
