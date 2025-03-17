@@ -4,18 +4,21 @@ A (n)top-like tool to show Ceph "dump_messenger" network information.
 
 ![Screenshot 2024-09-13 at 13 46 28](https://github.com/user-attachments/assets/e4903e72-8437-462d-8b26-0f3e6df6cae3)
 
-[Ceph PR #59780](https://github.com/ceph/ceph/pull/59780)
+## Dependencies
+
+- [Ceph PR #59780](https://github.com/ceph/ceph/pull/59780)
+- [Python librados bindings](https://docs.ceph.com/en/latest/rados/api/python/)
 
 ## Usage
 
+Point either `--conf` or the environment variable `CEPH_CONF` to your cluster's `ceph.conf`
+
 ```bash
-CEPH_CONF=/compile/ceph/build/ceph.conf \
-python3 cntop.py
+./cntop.py --conf ceph.conf
 ```
 
-Requires rados and ceph_argparse in the python module search path.
-If installed locally and ninja installed:
+To add local admin sockets use `--asok`:
 
 ```bash
-PYTHONPATH="/usr/lib64/python3.11/site-packages/:/usr/local/lib/python3.11/site-packages/"
+./cntop.py --asok /ceph/wip/out/radosgw.8000.asok
 ```
