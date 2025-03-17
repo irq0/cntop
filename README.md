@@ -22,3 +22,7 @@ To add local admin sockets use `--asok`:
 ```bash
 ./cntop.py --asok /ceph/wip/out/radosgw.8000.asok
 ```
+
+## Keys
+
+Use TAB to switch between service selector, ntop table and log
