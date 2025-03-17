@@ -398,11 +398,11 @@ class ConstatTable(Widget):
             yield table
 
     def row_key(self, msgr_name, c) -> str:
-        return pickle.dumps((self._target, msgr_name, c["conn_id"]))
+        return pickle.dumps((self._target, msgr_name, c["conn_id"]), 0).decode("ascii")
 
     @classmethod
-    def parse_row_key(cls, raw: bytes):
-        data = pickle.loads(raw)
+    def parse_row_key(cls, raw: str):
+        data = pickle.loads(raw.encode("ascii"))
         return ConstatRowKey(target=data[0], msgr_name=data[1], conn_id=data[2])
 
     def add_con_row(self, msgr_name: str, m: dict, c: dict) -> None:
