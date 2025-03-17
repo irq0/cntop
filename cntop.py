@@ -276,11 +276,10 @@ def get_tcpi_description(k: str) -> str:
 def discover_messengers(cluster: rados.Rados, target: CephTarget) -> list[str]:
     try:
         return command_json(cluster, target, prefix="messenger dump")["messengers"]
-    except CephCommandError as ex:
+    except CephCommandError:
         LOG.error(
-            'Failed to discover messengers on %s (%s). "messenger dump" supported?',
+            'Failed to discover messengers on %s. "messenger dump" supported?',
             format_ceph_target(target),
-            ex,
         )
         return []
 
@@ -684,7 +683,7 @@ class CephInspectorApp(App):
                 )
             yield Rule()
             yield ConstatTable(self.cluster, None, id="constat")
-        yield RichLog(id="log", highlight=True, markup=True)
+        yield RichLog(id="log", highlight=True, markup=True, wrap=True)
         yield Footer()
 
     def __init__(self, cluster, extra_asok, **kwargs):

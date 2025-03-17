@@ -1,6 +1,6 @@
 #log {
      dock: bottom;
-     height: 6;
+     height: 10;
      border: heavy gray;
      padding: 1;
      margin: 1;
