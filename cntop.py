@@ -777,6 +777,8 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="enable debug logging")
 
     args = parser.parse_args()
+    if not args.conf:
+        raise argparse.ArgumentTypeError("No config file specified")
     return args
 
 
