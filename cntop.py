@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 import json
 import logging
+import argparse
 import os
 from collections import namedtuple
 from collections.abc import Callable
 from datetime import timedelta
+import pathlib
+import pickle
+import socket
 from typing import Any, Literal
 
 import rados
@@ -35,7 +39,8 @@ from textual.widgets import (
 CephOSDTarget = tuple[Literal["osd"], int]
 CephMonTarget = tuple[Literal["mon"], str]
 CephMgrTarget = tuple[Literal["mgr"], str]
-CephTarget = CephOSDTarget | CephMonTarget | CephMgrTarget
+CephAsokTarget = tuple[Literal["asok"], pathlib.Path]
+CephTarget = CephOSDTarget | CephMonTarget | CephMgrTarget | CephAsokTarget
 
 LOG = logging.getLogger("cntop")
 
@@ -50,15 +55,36 @@ TCP_INFO_KEYS = [
 ]
 
 
-def connect() -> rados.Rados:
-    conffile = os.getenv("CEPH_CONF") or "/etc/ceph/ceph.conf"
-    cluster = rados.Rados(conffile=conffile)
+def connect(conffile: pathlib.Path) -> rados.Rados:
+    cluster = rados.Rados(conffile=conffile.as_posix())
     cluster.connect()
     LOG.info("Connected to cluster %s", cluster.get_fsid())
     return cluster
 
 
 CEPH_COMMAND_TIMEOUT_SECONDS = 0
+
+
+class CephCommandError(Exception):
+    pass
+
+
+def asok_command(path: pathlib.Path, cmd: str):
+    cmd += "\0"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.connect(path.as_posix())
+        LOG.debug("ASOK: %s --> %s", path, cmd)
+        sock.sendall(cmd.encode("utf-8"))
+        response_bytes = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response_bytes += chunk
+        LOG.debug("ASOK: %s <-- %s", path, response_bytes)
+    if b"ERROR:" in response_bytes:
+        raise CephCommandError(f'Ceph asok command "{cmd}" failed: {response_bytes}')
+    return 0, response_bytes[4:], b""
 
 
 def target_command(target: CephTarget, cluster: rados.Rados, cmd: str):
@@ -75,10 +101,12 @@ def target_command(target: CephTarget, cluster: rados.Rados, cmd: str):
             ret, outs, outbuf = cluster.mgr_command(
                 cmd=cmd, inbuf=b"", timeout=CEPH_COMMAND_TIMEOUT_SECONDS, target=mgr
             )
+        case ("asok", path):
+            ret, outs, outbuf = asok_command(path, cmd)
+
     if ret in (0, 1):
         return outs, outbuf
-    LOG.warning("json_command to %s failed", target)
-    raise RuntimeWarning(f'Ceph command "{cmd}" failed with {ret}: {outs}')
+    raise CephCommandError(f'Ceph command "{cmd}" failed with {ret}: {outs}')
 
 
 def command_outs(
@@ -93,7 +121,13 @@ def command_json(
 ) -> Any:
     kwargs["format"] = "json"
     outs, _ = target_command(target, cluster, json.dumps(kwargs))
-    return json.loads(outs.decode("utf-8"))
+    try:
+        j = json.loads(outs.decode("utf-8"))
+    except json.JSONDecodeError as ex:
+        LOG.error("JSON parse failed: %s", ex, exc_info=True)
+        ex.add_note(outs.decode("utf-8"))
+        raise
+    return j
 
 
 def command_lines(
@@ -119,11 +153,14 @@ def get_inventory(cluster: rados.Rados) -> dict[str, list[CephTarget]]:
 
 def ceph_status_kv(cluster: rados.Rados) -> dict[str, str]:
     """Ceph status as key value pairs. Human readable keys"""
-    return {
-        "ID": command_outs(cluster, prefix="fsid"),
-        "Health": command_outs(cluster, prefix="health"),
-        "": command_outs(cluster, prefix="osd stat"),
-    }
+    try:
+        return {
+            "ID": command_outs(cluster, prefix="fsid"),
+            "Health": command_outs(cluster, prefix="health"),
+            "": command_outs(cluster, prefix="osd stat"),
+        }
+    except CephCommandError as ex:
+        return {"ID": "", "Health": "", "": f"Error: {ex}"}
 
 
 def format_socket_addr(socket_addr: dict[str, Any]) -> str:
@@ -181,11 +218,14 @@ def format_tcpi_value(k: str, v: int) -> str:
         return str(v)
 
 
-def format_ceph_target(t: CephTarget | None) -> str:
-    if t:
-        return f"{t[0]}.{t[1]}"
-    else:
-        return "?.?"
+def format_ceph_target(target: CephTarget | None) -> str:
+    match target:
+        case ("asok", path):
+            return f"ASOK:{path}"
+        case (svc, name):
+            return f"{svc}.{name}"
+        case _:
+            return "?.?"
 
 
 def format_con_crypto(c) -> str:
@@ -234,18 +274,31 @@ def get_tcpi_description(k: str) -> str:
 
 
 def discover_messengers(cluster: rados.Rados, target: CephTarget) -> list[str]:
-    return command_json(cluster, target, prefix="messenger dump")["messengers"]
+    try:
+        return command_json(cluster, target, prefix="messenger dump")["messengers"]
+    except CephCommandError as ex:
+        LOG.error(
+            'Failed to discover messengers on %s (%s). "messenger dump" supported?',
+            format_ceph_target(target),
+            ex,
+        )
+        return []
 
 
 def dump_messenger(cluster: rados.Rados, target: CephTarget, msgr: str) -> Any:
-    return command_json(
-        cluster,
-        target=target,
-        prefix="messenger dump",
-        msgr=msgr,
-        tcp_info=True,
-        **{"dumpcontents:all": True},
-    )["messenger"]
+    try:
+        return command_json(
+            cluster,
+            target=target,
+            prefix="messenger dump",
+            msgr=msgr,
+            tcp_info=True,
+            **{"dumpcontents:all": True},
+        )["messenger"]
+    except CephCommandError as ex:
+        LOG.error(
+            'Messenger "%s" dump on %s failed: %s', msgr, format_ceph_target(target), ex
+        )
 
 
 def dump_messengers(
@@ -253,7 +306,9 @@ def dump_messengers(
 ) -> dict[str, Any]:
     result = {}
     for msgr in msgrs:
-        result[msgr] = dump_messenger(cluster, target, msgr)
+        dump = dump_messenger(cluster, target, msgr)
+        if dump:
+            result[msgr] = dump
     return result
 
 
@@ -344,11 +399,11 @@ class ConstatTable(Widget):
             yield table
 
     def row_key(self, msgr_name, c) -> str:
-        return json.dumps((self._target, msgr_name, c["conn_id"]))
+        return pickle.dumps((self._target, msgr_name, c["conn_id"]))
 
     @classmethod
     def parse_row_key(cls, raw: bytes):
-        data = json.loads(raw)
+        data = pickle.loads(raw)
         return ConstatRowKey(target=data[0], msgr_name=data[1], conn_id=data[2])
 
     def add_con_row(self, msgr_name: str, m: dict, c: dict) -> None:
@@ -609,9 +664,11 @@ class CephInspectorApp(App):
     CSS_PATH = "ntop.tcss"
 
     def _inventory_for_select(self):
+        inventory = get_inventory(self.cluster)
+        inventory["asok"] = [("asok", asok) for asok in self.extra_asok]
         return (
             (format_ceph_target(svc), svc)
-            for group in get_inventory(self.cluster).values()
+            for group in inventory.values()
             for svc in group
         )
 
@@ -630,11 +687,12 @@ class CephInspectorApp(App):
         yield RichLog(id="log", highlight=True, markup=True)
         yield Footer()
 
-    def __init__(self, cluster, **kwargs):
+    def __init__(self, cluster, extra_asok, **kwargs):
         super().__init__(**kwargs)
         self.cluster = cluster
         self.dark = False
         self.title = "Ceph Inspector"
+        self.extra_asok = extra_asok
 
     @on(DataTable.RowSelected)
     def show_details(self, event):
@@ -691,14 +749,47 @@ class CephInspectorApp(App):
         LOG.addHandler(handler)
 
 
+def path_exists(s: str) -> pathlib.Path:
+    p = pathlib.Path(s)
+    if not p.exists():
+        raise argparse.ArgumentTypeError(f"Path {s} does not exists")
+    return p
+
+
+def parse_args():
+    parser = argparse.ArgumentParser("cntop")
+    conf_env = os.environ.get("CEPH_CONF")
+    if conf_env:
+        conf_env = path_exists(conf_env)
+
+    parser.add_argument(
+        "--conf",
+        type=path_exists,
+        help="Ceph configuration. Defaults to CEPH_CONF environment variable",
+        default=conf_env,
+    )
+    parser.add_argument(
+        "--asok",
+        type=path_exists,
+        action="append",
+        default=[],
+        help="add ceph daemon admin socket",
+    )
+    parser.add_argument("--debug", action="store_true", help="enable debug logging")
+
+    args = parser.parse_args()
+    return args
+
+
 def main():
+    args = parse_args()
     logging.basicConfig(
-        level=logging.INFO,
+        level=[logging.INFO, logging.DEBUG][int(args.debug)],
         format="%(message)s",
         datefmt="[%Y-%m-%d %H:%M:%S]",
         handlers=[RichHandler(rich_tracebacks=True)],
     )
-    cluster = connect()
+    cluster = connect(args.conf)
 
     def watch_callback(
         arg, line, channel, name, who, stamp_sec, stamp_nsec, seq, level, msg
@@ -712,7 +803,7 @@ def main():
 
     cluster.monitor_log2("info", watch_callback, 0)
 
-    CephInspectorApp(cluster).run()
+    CephInspectorApp(cluster, args.asok).run()
 
 
 if __name__ == "__main__":
