@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import logging
-import argparse
 import os
-from collections import namedtuple
-from collections.abc import Callable
-from datetime import timedelta
 import pathlib
 import pickle
 import socket
-from typing import Any, Literal
+from collections.abc import Callable
+from datetime import timedelta
+from typing import Annotated, Any, Literal, NamedTuple, Optional, cast, override
 
 import rados
 import rich.box
+from pydantic import BaseModel, Field, field_validator
 from rich.console import Group
 from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.pretty import Pretty
 from rich.table import Table
+from rich.text import Text
 from textual import on
 from textual.app import App
 from textual.binding import Binding
@@ -36,22 +37,307 @@ from textual.widgets import (
     Static,
 )
 
-CephOSDTarget = tuple[Literal["osd"], int]
-CephMonTarget = tuple[Literal["mon"], str]
-CephMgrTarget = tuple[Literal["mgr"], str]
-CephAsokTarget = tuple[Literal["asok"], pathlib.Path]
-CephTarget = CephOSDTarget | CephMonTarget | CephMgrTarget | CephAsokTarget
-
 LOG = logging.getLogger("cntop")
 
+CEPH_COMMAND_TIMEOUT_SECONDS = 0
+
 # TCP INFO fields to show in table (see tcp(7), struct tcp_info in tcp.h)
+# Note: unit prefix is cut off during JSON parsing. See TCPInfo class
 TCP_INFO_KEYS = [
     "tcpi_total_retrans",
     "tcpi_state",
-    "tcpi_rtt_us",
-    "tcpi_rttvar_us",
-    "tcpi_last_data_recv_ms",
-    "tcpi_last_data_sent_ms",
+    "tcpi_rtt",
+    "tcpi_rttvar",
+    "tcpi_last_data_recv",
+    "tcpi_last_data_sent",
+]
+
+
+class EntityNameT(BaseModel):
+    type: str
+    num: int
+
+
+class EntityName(BaseModel):
+    type: int
+    id: str
+
+
+class EntityAddr(BaseModel):
+    type: str
+    addr: str
+    nonce: int
+
+    def human(self) -> str:
+        if self.type == "none":
+            return "∅"
+        elif self.type == "any":
+            return f"#{str(self.nonce)}"
+        else:
+            return f"{self.type}/{self.addr}#{str(self.nonce)}"
+
+
+class AddrVec(BaseModel):
+    addrvec: list[EntityAddr]
+
+
+class Socket(BaseModel):
+    socket_fd: int | None
+    worker_id: int | None
+
+
+class DispatchQueue(BaseModel):
+    length: int
+    max_age_ago: str  # TODO support utimespan_str
+
+
+class ConnectionStatus(BaseModel):
+    connected: bool
+    loopback: bool
+
+    def connected_human(self) -> str:
+        return "✔" if self.connected else "𐄂"
+
+
+def format_timedelta_compact(d: timedelta) -> str:
+    total_sec = d.total_seconds()
+    if total_sec >= 1:
+        return f"{total_sec:.3f} s"
+    elif total_sec >= 1e-3:
+        return f"{total_sec * 1e3:.3f} ms"
+    elif total_sec == 0:
+        return "0"
+    else:
+        return f"{total_sec * 1e6:.0f} µs"
+
+
+class TCPInfo(BaseModel):
+    tcpi_state: str
+    tcpi_retransmits: int
+    tcpi_probes: int
+    tcpi_backoff: int
+    tcpi_rto: timedelta = Field(alias="tcpi_rto_us")
+    tcpi_ato: timedelta = Field(alias="tcpi_ato_us")
+    tcpi_snd_mss: int
+    tcpi_rcv_mss: int
+    tcpi_unacked: int
+    tcpi_lost: int
+    tcpi_retrans: int
+    tcpi_pmtu: int
+    tcpi_rtt: timedelta = Field(alias="tcpi_rtt_us")
+    tcpi_rttvar: timedelta = Field(alias="tcpi_rttvar_us")
+    tcpi_total_retrans: int
+    tcpi_last_data_sent: timedelta = Field(alias="tcpi_last_data_sent_ms")
+    tcpi_last_ack_sent: timedelta = Field(alias="tcpi_last_ack_sent_ms")
+    tcpi_last_data_recv: timedelta = Field(alias="tcpi_last_data_recv_ms")
+    tcpi_last_ack_recv: timedelta = Field(alias="tcpi_last_ack_recv_ms")
+    tcpi_options: list[str]
+
+    @field_validator("tcpi_rto", "tcpi_ato", "tcpi_rtt", "tcpi_rttvar", mode="before")
+    @classmethod
+    def us_timedelta(cls, value: int) -> timedelta:
+        return timedelta(milliseconds=value / 1000)
+
+    @field_validator(
+        "tcpi_last_data_sent",
+        "tcpi_last_ack_sent",
+        "tcpi_last_data_recv",
+        "tcpi_last_ack_recv",
+        mode="before",
+    )
+    @classmethod
+    def ms_timedelta(cls, value: int) -> timedelta:
+        return timedelta(milliseconds=value)
+
+    def human(self, k: str) -> str:
+        v = getattr(self, k)
+        if v:
+            if isinstance(v, timedelta):
+                return format_timedelta_compact(v)
+            else:
+                return str(v)
+        else:
+            return ""
+
+
+class Peer(BaseModel):
+    entity_name: EntityName
+    type: str
+    id: int
+    global_id: int
+    addr: AddrVec
+
+    def human(self):
+        return f"{self.global_id}/{self.id}" if self.id != -1 else "∅"
+
+
+class ProtocolV2Crypto(BaseModel):
+    rx: str
+    tx: str
+
+
+class ProtocolV2Compression(BaseModel):
+    rx: str
+    tx: str
+
+
+class ProtocolV1(BaseModel):
+    state: str
+    connect_seq: int
+    peer_global_seq: int
+    con_mode: Optional[str]
+
+
+class ProtocolV2(BaseModel):
+    state: str
+    connect_seq: int
+    peer_global_seq: int
+    con_mode: Optional[str]
+    rev1: bool
+    crypto: ProtocolV2Crypto
+    compression: ProtocolV2Compression
+
+
+class Protocol(BaseModel):
+    v1: Optional[ProtocolV1] = None
+    v2: Optional[ProtocolV2] = None
+
+    def crypto(self) -> str:
+        if self.v2:
+            crypto = self.v2.crypto
+            if crypto.rx == crypto.tx:
+                return crypto.rx
+            else:
+                return f"{crypto.rx}/{crypto.tx}"
+        else:
+            return "-"
+
+    def compression(self) -> str:
+        if self.v2:
+            comp = self.v2.compression
+            if comp.rx == comp.tx:
+                return comp.rx
+            else:
+                return f"{comp.rx}/{comp.tx}"
+        else:
+            return "-"
+
+    def mode(self) -> str:
+        if self.v2:
+            return self.v2.con_mode or ""
+        if self.v1:
+            return self.v1.con_mode or ""
+        return ""
+
+
+class AsyncConnection(BaseModel):
+    state: str
+    messenger_nonce: int
+    status: ConnectionStatus
+    socket_fd: int | None
+    tcp_info: TCPInfo | None
+    conn_id: int
+    peer: Peer
+    last_connect_started_ago: str  # TODO support timepan_str
+    last_active_ago: str
+    recv_start_time_ago: str
+    last_tick_id: int
+    socket_addr: EntityAddr
+    target_addr: EntityAddr
+    port: int
+    protocol: Protocol
+    worker_id: int
+
+
+class Connection(BaseModel):
+    addrvec: list[EntityAddr]
+    async_connection: AsyncConnection
+
+
+class Messenger(BaseModel):
+    nonce: int
+    my_name: EntityNameT
+    my_addrs: AddrVec
+    listen_sockets: list[Socket] = []
+    dispatch_queue: DispatchQueue
+    connections_count: int
+    connections: list[Connection]
+    anon_conns: list[AsyncConnection]
+    accepting_conns: list[AsyncConnection]
+    deleted_conns: list[AsyncConnection]
+    local_connection: list[AsyncConnection]
+
+    def direction(self, connection: AsyncConnection):
+        if connection.socket_addr in self.my_addrs.addrvec:
+            return "IN"
+        else:
+            return "OUT"
+
+
+class MessengerDump(BaseModel):
+    name: str
+    messenger: Messenger
+
+
+class CephTargetBase(BaseModel):
+    class Config:
+        frozen = True
+
+
+class CephOSDTarget(CephTargetBase):
+    type: Literal["osd"]
+    id: int
+
+    def to_tuple(self):
+        return (self.type, self.id)
+
+    @override
+    def __str__(self) -> str:
+        return f"osd.{self.id}"
+
+
+class CephMonTarget(CephTargetBase):
+    type: Literal["mon"]
+    name: str
+
+    def to_tuple(self):
+        return (self.type, self.name)
+
+    @override
+    def __str__(self) -> str:
+        if self.name:
+            return f"mon.{self.name}"
+        else:
+            return "mon"
+
+
+class CephMgrTarget(CephTargetBase):
+    type: Literal["mgr"]
+    name: str
+
+    def to_tuple(self):
+        return (self.type, self.name)
+
+    @override
+    def __str__(self) -> str:
+        return f"mgr.{self.name}"
+
+
+class CephAsokTarget(CephTargetBase):
+    type: Literal["asok"]
+    path: pathlib.Path
+
+    def to_tuple(self):
+        return (self.type, self.path)
+
+    @override
+    def __str__(self) -> str:
+        return f"ASOK:{self.path}"
+
+
+CephTarget = Annotated[
+    CephOSDTarget | CephMonTarget | CephMgrTarget | CephAsokTarget,
+    Field(discriminator="type"),
 ]
 
 
@@ -60,9 +346,6 @@ def connect(conffile: pathlib.Path) -> rados.Rados:
     cluster.connect()
     LOG.info("Connected to cluster %s", cluster.get_fsid())
     return cluster
-
-
-CEPH_COMMAND_TIMEOUT_SECONDS = 0
 
 
 class CephCommandError(Exception):
@@ -87,54 +370,68 @@ def asok_command(path: pathlib.Path, cmd: str):
     return 0, response_bytes[4:], b""
 
 
-def target_command(target: CephTarget, cluster: rados.Rados, cmd: str):
+def target_command(
+    target: CephTarget, cluster: rados.Rados, cmd: str
+) -> tuple[str, str]:
     match target:
-        case ("osd", osdid):
+        case CephOSDTarget(type="osd", id=osdid):
             ret, outs, outbuf = cluster.osd_command(
                 osdid=osdid, cmd=cmd, inbuf=b"", timeout=CEPH_COMMAND_TIMEOUT_SECONDS
             )
-        case ("mon", monid):
+        case CephMonTarget(type="mon", name=monid):
             ret, outs, outbuf = cluster.mon_command(
                 cmd=cmd, inbuf=b"", timeout=CEPH_COMMAND_TIMEOUT_SECONDS, target=monid
             )
-        case ("mgr", mgr):
+        case CephMgrTarget(type="mgr", name=mgr):
             ret, outs, outbuf = cluster.mgr_command(
                 cmd=cmd, inbuf=b"", timeout=CEPH_COMMAND_TIMEOUT_SECONDS, target=mgr
             )
-        case ("asok", path):
+        case CephAsokTarget(type="asok", path=path):
             ret, outs, outbuf = asok_command(path, cmd)
 
-    if ret in (0, 1):
+    LOG.debug("cmd %r ret: %r", cmd, ret)
+
+    if ret == 0:
+        if isinstance(outs, bytes):
+            outs = outs.decode("utf-8")
+        if isinstance(outbuf, bytes):
+            outbuf = outbuf.decode("utf-8")
         return outs, outbuf
     raise CephCommandError(f'Ceph command "{cmd}" failed with {ret}: {outs}')
 
 
 def command_outs(
-    cluster: rados.Rados, target: CephTarget = ("mon", ""), **kwargs
+    cluster: rados.Rados,
+    target: CephTarget = CephMonTarget(type="mon", name=""),
+    **kwargs: Any,
 ) -> str:
     outs, _ = target_command(target, cluster, json.dumps(kwargs))
-    return outs.decode("utf-8").strip()
+    return outs.strip()
 
 
 def command_json(
-    cluster: rados.Rados, target: CephTarget = ("mon", ""), **kwargs
+    cluster: rados.Rados,
+    target: CephTarget = CephMonTarget(type="mon", name=""),
+    **kwargs: Any,
 ) -> Any:
     kwargs["format"] = "json"
     outs, _ = target_command(target, cluster, json.dumps(kwargs))
     try:
-        j = json.loads(outs.decode("utf-8"))
+        j = json.loads(outs)
     except json.JSONDecodeError as ex:
         LOG.error("JSON parse failed: %s", ex, exc_info=True)
-        ex.add_note(outs.decode("utf-8"))
+        ex.add_note(outs)
         raise
     return j
 
 
 def command_lines(
-    cluster: rados.Rados, target: CephTarget = ("mon", ""), **kwargs
+    cluster: rados.Rados,
+    target: CephTarget = CephMonTarget(type="mon", name=""),
+    **kwargs: Any,
 ) -> list[str]:
     outs, _ = target_command(target, cluster, json.dumps(kwargs))
-    return [line.decode("utf-8") for line in outs.split(b"\n") if line]
+    return [line for line in outs.splitlines() if line]
 
 
 def get_inventory(cluster: rados.Rados) -> dict[str, list[CephTarget]]:
@@ -142,11 +439,19 @@ def get_inventory(cluster: rados.Rados) -> dict[str, list[CephTarget]]:
     Get Ceph cluster inventory as dict of type -> [target, ...]
     """
     return {
-        "osd": [("osd", int(osd)) for osd in command_lines(cluster, prefix="osd ls")],
-        "mon": [
-            ("mon", m["name"]) for m in command_json(cluster, prefix="mon dump")["mons"]
+        "osd": [
+            CephOSDTarget(type="osd", id=int(osd))
+            for osd in command_lines(cluster, prefix="osd ls")
         ],
-        "mgr": [("mgr", command_json(cluster, prefix="mgr dump")["active_name"])],
+        "mon": [
+            CephMonTarget(type="mon", name=m["name"])
+            for m in command_json(cluster, prefix="mon dump")["mons"]
+        ],
+        "mgr": [
+            CephMgrTarget(
+                type="mgr", name=command_json(cluster, prefix="mgr dump")["active_name"]
+            )
+        ],
         # TODO add mds
     }
 
@@ -161,93 +466,6 @@ def ceph_status_kv(cluster: rados.Rados) -> dict[str, str]:
         }
     except CephCommandError as ex:
         return {"ID": "", "Health": "", "": f"Error: {ex}"}
-
-
-def format_socket_addr(socket_addr: dict[str, Any]) -> str:
-    if socket_addr["type"] == "none":
-        return "∅"
-    elif socket_addr["type"] == "any":
-        return f"#{str(socket_addr['nonce'])}"
-    else:
-        return (
-            f"{socket_addr['type']}/{socket_addr['addr']}#{str(socket_addr['nonce'])}"
-        )
-
-
-def format_timedelta_compact(d: timedelta) -> str:
-    total_sec = d.total_seconds()
-    if total_sec >= 1:
-        return f"{total_sec:.3f} s"
-    elif total_sec >= 1e-3:
-        return f"{total_sec * 1e3:.3f} ms"
-    elif total_sec == 0:
-        return "0"
-    else:
-        return f"{total_sec * 1e6:.0f} µs"
-
-
-def format_connection_type(m: dict, c: dict) -> str:
-    if c["socket_addr"] in m["my_addrs"]["addrvec"]:
-        return "IN"
-    else:
-        return "OUT"
-
-
-def format_tcpi_key(raw: str) -> str:
-    result = raw.replace("tcpi_", "")
-    if result.endswith("_ms") or result.endswith("_us"):
-        result = result.replace("_us", "").replace("_ms", "")
-    return result.replace("_", " ")
-
-
-def format_tcpi_unit(k: str) -> str:
-    if k.endswith("_ms"):
-        return "ms"
-    elif k.endswith("_us"):
-        return "µs"
-    else:
-        return ""
-
-
-def format_tcpi_value(k: str, v: int) -> str:
-    if k.endswith("_ms"):
-        return format_timedelta_compact(timedelta(milliseconds=v))
-    elif k.endswith("_us"):
-        return format_timedelta_compact(timedelta(milliseconds=v / 1000))
-    else:
-        return str(v)
-
-
-def format_ceph_target(target: CephTarget | None) -> str:
-    match target:
-        case ("asok", path):
-            return f"ASOK:{path}"
-        case (svc, name):
-            return f"{svc}.{name}"
-        case _:
-            return "?.?"
-
-
-def format_con_crypto(c) -> str:
-    if "v2" in c["protocol"]:
-        c = c["protocol"]["v2"]["crypto"]
-        if c["rx"] == c["tx"]:
-            return c["rx"]
-        else:
-            return "p['rx']/p['tx']"
-    else:
-        return "-"
-
-
-def format_con_compression(c) -> str:
-    if "v2" in c["protocol"]:
-        c = c["protocol"]["v2"]["compression"]
-        if c["rx"] == c["tx"]:
-            return c["rx"]
-        else:
-            return "p['rx']/p['tx']"
-    else:
-        return "-"
 
 
 def get_tcpi_description(k: str) -> str:
@@ -279,31 +497,38 @@ def discover_messengers(cluster: rados.Rados, target: CephTarget) -> list[str]:
     except CephCommandError:
         LOG.error(
             'Failed to discover messengers on %s. "messenger dump" supported?',
-            format_ceph_target(target),
+            target,
         )
         return []
 
 
-def dump_messenger(cluster: rados.Rados, target: CephTarget, msgr: str) -> Any:
+def dump_messenger(
+    cluster: rados.Rados, target: CephTarget, msgr: str
+) -> Messenger | None:
     try:
-        return command_json(
-            cluster,
-            target=target,
-            prefix="messenger dump",
-            msgr=msgr,
-            tcp_info=True,
-            **{"dumpcontents:all": True},
-        )["messenger"]
+        return MessengerDump.model_validate_json(
+            target_command(
+                target,
+                cluster,
+                json.dumps(
+                    {
+                        "prefix": "messenger dump",
+                        "msgr": msgr,
+                        "tcp_info": True,
+                        "dumpcontents:all": True,
+                    }
+                ),
+            )[0]
+        ).messenger
     except CephCommandError as ex:
-        LOG.error(
-            'Messenger "%s" dump on %s failed: %s', msgr, format_ceph_target(target), ex
-        )
+        LOG.error('Messenger "%s" dump on %s failed: %s', msgr, target, ex)
+        return None
 
 
 def dump_messengers(
     cluster: rados.Rados, target: CephTarget, msgrs: list[str]
-) -> dict[str, Any]:
-    result = {}
+) -> dict[str, Messenger]:
+    result: dict[str, Messenger] = {}
     for msgr in msgrs:
         dump = dump_messenger(cluster, target, msgr)
         if dump:
@@ -311,17 +536,11 @@ def dump_messengers(
     return result
 
 
-def pick_tcp_info(ti: dict) -> list[str]:
+def pick_tcp_info(ti: TCPInfo | None) -> list[str]:
     if ti:
-        result = [ti[k] for k in TCP_INFO_KEYS]
-        for i, k in enumerate(TCP_INFO_KEYS):
-            result[i] = format_tcpi_value(k, result[i])
-        return result
+        return [ti.human(k) for k in TCP_INFO_KEYS]
     else:
         return [""] * len(TCP_INFO_KEYS)
-
-
-ConstatRowKey = namedtuple("ConstatRowKey", ["target", "msgr_name", "conn_id"])
 
 
 class ConstatTable(Widget):
@@ -363,26 +582,30 @@ class ConstatTable(Widget):
         ("Local", ("addr",)),
         ("Remote", ("addr",)),
         ("Last Active", ()),
-    ] + [(format_tcpi_key(k), ("tcpi",)) for k in TCP_INFO_KEYS]
+    ] + [(k, ("tcpi",)) for k in TCP_INFO_KEYS]
 
-    def __init__(self, cluster: rados.Rados, target: CephTarget | None, **kwargs):
+    RowKey = NamedTuple(
+        "ConstatRowKey", [("target", CephTarget), ("msgr_name", str), ("conn_id", int)]
+    )
+
+    cluster: rados.Rados
+    target: CephTarget | None
+    show_tag: str
+    sort_order: str
+    data: dict[str, Messenger]
+    messengers: list[str]
+    table: DataTable[str]
+
+    def __init__(self, cluster: rados.Rados, target: CephTarget | None, **kwargs: Any):
         super().__init__(**kwargs)
-        self.cluster: rados.Rados = cluster
-        self._target: CephTarget | None = target
+        self.cluster = cluster
+        self.target = target
         self.show_tag = "all"
         self.sort_order = "default"
-        self.data: dict[str, Any] | None
+        self.data = {}
         self.messengers = []
 
-    @property
-    def target(self) -> CephTarget | None:
-        return self._target
-
-    @target.setter
-    def target(self, val: CephTarget):
-        self._target = val
-
-    def rebuild_columns(self):
+    def rebuild_columns(self) -> None:
         for k in list(self.table.columns.keys()):
             self.table.remove_column(k)
         for col, tags in self.columns:
@@ -390,44 +613,42 @@ class ConstatTable(Widget):
                 self.table.add_column(col, key=col)
 
     def compose(self):
-        table = DataTable(cursor_type="row")
+        table: DataTable[str] = DataTable(cursor_type="row")
         for col, _tags in self.columns:
             table.add_column(col, key=col)
         self.table = table
         with Vertical():
             yield table
 
-    def row_key(self, msgr_name, c) -> str:
-        return pickle.dumps((self._target, msgr_name, c["conn_id"]), 0).decode("ascii")
+    def row_key(self, msgr_name: str, c: AsyncConnection) -> str:
+        return pickle.dumps((self.target, msgr_name, c.conn_id), 0).decode("ascii")
 
     @classmethod
-    def parse_row_key(cls, raw: str):
+    def parse_row_key(cls, raw: str | None) -> RowKey | None:
+        if not raw:
+            return None
         data = pickle.loads(raw.encode("ascii"))
-        return ConstatRowKey(target=data[0], msgr_name=data[1], conn_id=data[2])
+        return cls.RowKey(target=data[0], msgr_name=data[1], conn_id=data[2])
 
-    def add_con_row(self, msgr_name: str, m: dict, c: dict) -> None:
+    def add_con_row(self, msgr_name: str, m: Messenger, c: AsyncConnection) -> None:
         all_col_row_data = [
             msgr_name,
-            str(c["conn_id"]),
-            str(c["socket_fd"]) if c["socket_fd"] else "∅",
-            str(c["worker_id"]),
-            c["state"].replace("STATE_", ""),
-            "✔" if c["status"]["connected"] else "𐄂",
-            c["peer"]["entity_name"]["id"],
-            c["peer"]["type"],
-            format_con_crypto(c),
-            format_con_compression(c),
-            next(iter(c["protocol"].values()))["con_mode"],
-            (
-                f"{c['peer']['global_id']}/{c['peer']['id']}"
-                if c["peer"]["id"] != -1
-                else "∅"
-            ),
-            format_connection_type(m, c),
-            format_socket_addr(c["socket_addr"]),
-            format_socket_addr(c["target_addr"]),
-            c["last_active_ago"],
-        ] + pick_tcp_info(c["tcp_info"])
+            str(c.conn_id),
+            str(c.socket_fd) if c.socket_fd else "∅",
+            str(c.worker_id),
+            c.state.replace("STATE_", ""),
+            c.status.connected_human(),
+            c.peer.entity_name.id,
+            c.peer.type,
+            c.protocol.crypto(),
+            c.protocol.compression(),
+            c.protocol.mode(),
+            c.peer.human(),
+            m.direction(c),
+            c.socket_addr.human(),
+            c.target_addr.human(),
+            c.last_active_ago,
+        ] + pick_tcp_info(c.tcp_info)
 
         self.table.add_row(
             *[
@@ -443,7 +664,6 @@ class ConstatTable(Widget):
             return
         self.messengers = discover_messengers(self.cluster, self.target)
         self.data = dump_messengers(self.cluster, self.target, self.messengers)
-        LOG.info(self.messengers)
 
     def refresh_table(self) -> None:
         if not self.table.columns or not self.target:
@@ -453,19 +673,19 @@ class ConstatTable(Widget):
         self.messengers = discover_messengers(self.cluster, self.target)
         self.data = dump_messengers(self.cluster, self.target, self.messengers)
         for name, m in self.data.items():
-            for addr_con in m["connections"]:
-                c = addr_con["async_connection"]
+            for addr_con in m.connections:
+                c = addr_con.async_connection
                 self.add_con_row(name, m, c)
-            for c in m["anon_conns"]:
+            for c in m.anon_conns:
                 self.add_con_row(name, m, c)
         self.action_sort(self.sort_order)
 
-    def action_columns(self, tag):
+    def action_columns(self, tag: str):
         LOG.info("Showing %s columns", tag)
         self.show_tag = tag
         self.refresh_table()
 
-    def action_sort(self, order):
+    def action_sort(self, order: str):
         self.sort_order = order
         if order == "default":
             self.table.sort("Messenger", "Conn#")
@@ -480,12 +700,12 @@ class CephStatus(Static):
 
     data = reactive("Fetching ceph status...\n\n")
 
-    def __init__(self, cluster: rados.Rados, **kwargs):
+    def __init__(self, cluster: rados.Rados, **kwargs: Any):
         super().__init__(**kwargs)
         self.cluster: rados.Rados = cluster
 
     async def on_mount(self) -> None:
-        self.set_interval(1, self.update_status)
+        self.set_interval(5, self.update_status)
 
     async def update_status(self) -> None:
         self.data = "\n".join(
@@ -496,7 +716,7 @@ class CephStatus(Static):
         return self.data
 
 
-class DetailsScreen(ModalScreen):
+class DetailsScreen(ModalScreen[bool]):
     """
     Show connection details in a modal overlay
     """
@@ -506,44 +726,51 @@ class DetailsScreen(ModalScreen):
         Binding("r", "refresh", "Refresh"),
     ]
 
+    cluster: rados.Rados
+    target: CephTarget
+    msgr_name: str
+    con_id: int
+    get_messenger_data: Callable[[], dict[str, Messenger]]
+    messenge_data: dict[str, Messenger]
+
     def __init__(
         self,
         cluster: rados.Rados,
         target: CephTarget,
         msgr_name: str,
         con_id: int,
-        get_messenger_data: Callable[[], dict[str, Any] | None],
-        **kwargs,
+        get_messenger_data: Callable[[], dict[str, Messenger]],
+        **kwargs: Any,
     ):
         super().__init__(**kwargs)
-        self.cluster: rados.Rados = cluster
-        self.target: CephTarget = target
-        self.msgr_name: str = msgr_name
-        self.con_id: int = con_id
+        self.cluster = cluster
+        self.target = target
+        self.msgr_name = msgr_name
+        self.con_id = con_id
         self.get_messenger_data = get_messenger_data
         self.messenger_data = get_messenger_data()
 
     @classmethod
-    def _listens_table(cls, m) -> Group:
+    def _listens_table(cls, m: Messenger) -> Group:
         table_addrs = Table(
             show_header=True, box=rich.box.SIMPLE, title="Service Addresses"
         )
         table_addrs.add_column("Proto")
         table_addrs.add_column("Addr")
         table_addrs.add_column("Nonce")
-        for addr in m["my_addrs"]["addrvec"]:
-            table_addrs.add_row(addr["type"], addr["addr"], str(addr["nonce"]))
+        for addr in m.my_addrs.addrvec:
+            table_addrs.add_row(addr.type, addr.addr, str(addr.nonce))
 
         table_listen = Table(
             show_header=True, box=rich.box.SIMPLE, title="Listen Sockets"
         )
         table_listen.add_column("FD")
         table_listen.add_column("Worker")
-        for listen in m["listen_sockets"]:
+        for listen in m.listen_sockets:
             table_listen.add_row(
                 *[
-                    str(listen["socket_fd"]),
-                    str(listen["worker_id"]),
+                    str(listen.socket_fd),
+                    str(listen.worker_id),
                 ]
             )
 
@@ -557,11 +784,14 @@ class DetailsScreen(ModalScreen):
 
         m = self.messenger_data[self.msgr_name]
         return Group(
-            Panel(Pretty(m["my_name"]), title="my_name"),
+            Panel(
+                Text(f"Target: {self.target}, my_name: {m.my_name}"),
+                title="Ceph Service",
+            ),
             Panel(self._listens_table(m), title="Listen"),
         )
 
-    def get_con_data(self) -> dict | None:
+    def get_con_data(self) -> AsyncConnection | None:
         if not self.messenger_data:
             return None
         try:
@@ -570,15 +800,13 @@ class DetailsScreen(ModalScreen):
                     [
                         *[
                             con
-                            for con in self.messenger_data[self.msgr_name]["anon_conns"]
-                            if con["conn_id"] == self.con_id
+                            for con in self.messenger_data[self.msgr_name].anon_conns
+                            if con.conn_id == self.con_id
                         ],
                         *[
-                            con["async_connection"]
-                            for con in self.messenger_data[self.msgr_name][
-                                "connections"
-                            ]
-                            if con["async_connection"]["conn_id"] == self.con_id
+                            con.async_connection
+                            for con in self.messenger_data[self.msgr_name].connections
+                            if con.async_connection.conn_id == self.con_id
                         ],
                     ]
                 )
@@ -595,7 +823,7 @@ class DetailsScreen(ModalScreen):
 
         data = {
             k: v
-            for k, v in self.messenger_data[self.msgr_name].items()
+            for k, v in self.messenger_data.items()
             if k not in ("connections", "anon_conns")
         }
         return Group(Panel(Pretty(data), title="Messenger"))
@@ -607,17 +835,14 @@ class DetailsScreen(ModalScreen):
         table_tcpi.add_column("Description")
 
         con = self.get_con_data()
-        if con and con.get("tcp_info"):
-            for k, v in con.get("tcp_info", {}).items():
-                table_tcpi.add_row(
-                    format_tcpi_key(k), format_tcpi_value(k, v), get_tcpi_description(k)
-                )
+        if con and con.tcp_info:
+            for k, v in vars(con.tcp_info).items():
+                table_tcpi.add_row(k, str(v), get_tcpi_description(k))
 
         return Group(Panel(table_tcpi, title="TCP Info"))
 
     def compose(self):
         with ScrollableContainer():
-            yield Label(f"Target: {self.target}")
             yield Static(self.rich_messenger_info(), id="msgr_info")
             yield Static(self.rich_tcpi(), id="tcpi")
             yield Static(self.rich_conn_info(), id="conn_info")
@@ -626,8 +851,8 @@ class DetailsScreen(ModalScreen):
 
     def action_refresh(self):
         LOG.info(
-            "Refreshing %s/%s/%s details...",
-            format_ceph_target(self.target),
+            "Refreshing target=%s msgr=%s conn=%s details...",
+            self.target,
             self.msgr_name,
             self.con_id,
         )
@@ -645,16 +870,16 @@ class StreamLogToRichLogProxy:
         super().__init__()
         self.widget = log_widget
 
-    def write(self, message):
+    def write(self, message: str) -> None:
         if message.endswith("\n"):
             message = message[:-1]
         self.widget.write(message)
 
-    def flush(self):
+    def flush(self) -> None:
         pass
 
 
-class CephInspectorApp(App):
+class CephInspectorApp(App[bool]):
     BINDINGS = [
         Binding("q,esc", "app.quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
@@ -662,49 +887,55 @@ class CephInspectorApp(App):
 
     CSS_PATH = "ntop.tcss"
 
-    def _inventory_for_select(self):
-        inventory = get_inventory(self.cluster)
-        inventory["asok"] = [("asok", asok) for asok in self.extra_asok]
-        return (
-            (format_ceph_target(svc), svc)
-            for group in inventory.values()
-            for svc in group
-        )
+    cluster: rados.Rados
+    extra_asok: list[pathlib.Path]
 
-    def compose(self):
-        yield Header()
-        with Vertical(id="main"):
-            yield CephStatus(self.cluster, id="status")
-            yield Rule()
-            with Horizontal():
-                yield Label("Select Ceph Service: ")
-                yield Select(
-                    self._inventory_for_select(), allow_blank=True, id="service"
-                )
-            yield Rule()
-            yield ConstatTable(self.cluster, None, id="constat")
-        yield RichLog(id="log", highlight=True, markup=True, wrap=True)
-        yield Footer()
-
-    def __init__(self, cluster, extra_asok, **kwargs):
+    def __init__(
+        self, cluster: rados.Rados, extra_asok: list[pathlib.Path], **kwargs: Any
+    ):
         super().__init__(**kwargs)
         self.cluster = cluster
         self.dark = False
         self.title = "Ceph Inspector"
         self.extra_asok = extra_asok
 
+    def _inventory_for_select(self) -> list[tuple[str, CephTarget]]:
+        inventory = get_inventory(self.cluster)
+        inventory["asok"] = [
+            CephAsokTarget(type="asok", path=asok) for asok in self.extra_asok
+        ]
+        return [(str(svc), svc) for group in inventory.values() for svc in group]
+
+    def compose(self):
+        select: Select[CephTarget] = Select(
+            self._inventory_for_select(), allow_blank=True, id="service"
+        )
+        yield Header()
+        with Vertical(id="main"):
+            yield CephStatus(self.cluster, id="status")
+            yield Rule()
+            with Horizontal():
+                yield Label("Select Ceph Service: ")
+                yield select
+            yield Rule()
+            yield ConstatTable(self.cluster, None, id="constat")
+        yield RichLog(id="log", highlight=True, markup=True, wrap=True)
+        yield Footer()
+
     @on(DataTable.RowSelected)
-    def show_details(self, event):
+    def show_details(self, event: DataTable.RowSelected):
         constat = self.query_one(ConstatTable)
         key = constat.parse_row_key(event.row_key.value)
+        if not key:
+            return
 
-        def update_get_messenger_data():
+        def update_get_messenger_data() -> dict[str, Messenger]:
             constat.refresh_data()
             return constat.data
 
         LOG.info(
-            "Showing details: %s/%s/%s",
-            format_ceph_target(key.target),
+            "Showing details: target=%s msgr=%s conn=%s",
+            key.target,
             key.msgr_name,
             key.conn_id,
         )
@@ -720,22 +951,19 @@ class CephInspectorApp(App):
 
     @on(Select.Changed)
     def select_changed(self, event: Select.Changed) -> None:
-        if (
-            event.value is not Select.BLANK
-            and isinstance(event.value, tuple)
-            and len(event.value) == 2
-        ):
-            target: CephTarget = event.value
-            self.title = f"cntop: {format_ceph_target(event.value)}"
-            constat = self.query_one(ConstatTable)
-            constat.focus()
-            constat.table.focus()
-            constat.target = target
-            constat.refresh_table()
+        if event.value is Select.BLANK:
+            return
+        target = cast(CephTarget, event.value)
+        self.title = f"cntop: {target}"
+        constat = self.query_one(ConstatTable)
+        constat.focus()
+        constat.table.focus()
+        constat.target = target
+        constat.refresh_table()
 
     def action_refresh(self):
         LOG.info("Refreshing...")
-        select = self.query_one(Select)
+        select = self.query_one(Select[CephTarget])
         select.set_options(self._inventory_for_select())
         constat = self.query_one(ConstatTable)
         constat.refresh_table()
@@ -793,7 +1021,16 @@ def main():
     cluster = connect(args.conf)
 
     def watch_callback(
-        arg, line, channel, name, who, stamp_sec, stamp_nsec, seq, level, msg
+        _arg: object,
+        _line: str,
+        channel: bytes,
+        name: bytes,
+        _who: str,
+        _stamp_sec: int,
+        _stamp_nsec: int,
+        _seq: int,
+        _level: str,
+        msg: bytes,
     ):
         LOG.info(
             "[CEPH] %s | %s: %s",
