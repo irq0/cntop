@@ -1,0 +1,12 @@
+{
+    "pythonVersion": "3.13",
+    "pythonPlatform": "All",
+    "venv": ".venv",
+    "typeCheckingMode": "strict",
+    "exclude": [
+        "**/__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv"
+    ]
+}

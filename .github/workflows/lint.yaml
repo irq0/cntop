@@ -16,8 +16,13 @@ jobs:
           python-version: "3.13"
       - name: Install ceph rados python library + depends
         run: sudo apt install -y python3-rados
-      - name: Install dependencies
+      - name: Setup python env
         run: |
+          python -m venv --system-site-packages .venv
+          source .venv/bin/activate
           python -m pip install --upgrade pip basedpyright
           pip install -r requirements.txt
-      - run: basedpyright
+      - name: Run basedpyright
+        run: |
+          source .venv/bin/activate
+          basedpyright
