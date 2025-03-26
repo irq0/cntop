@@ -1,6 +1,6 @@
 # cntop
 
-A (n)top-like tool to show Ceph "dump_messenger" network information.
+A (n)top-like tool to show Ceph "messenger dump" network information.
 
 ![Screenshot 2024-09-13 at 13 46 28](https://github.com/user-attachments/assets/e4903e72-8437-462d-8b26-0f3e6df6cae3)
 
