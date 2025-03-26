@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v3
         with:
-          python-version: "3.13"
+          python-version: "3.12"
       - name: Install ceph rados python library + depends
         run: sudo apt install -y python3-rados
       - name: Setup python env

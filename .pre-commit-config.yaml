@@ -26,7 +26,6 @@ repos:
     rev: 14197bfec1f357a9dc6b0c82a434a8f4c29de4b7  # frozen: v2.5.0
     hooks:
       - id: pycln
-        language_version: "3.13"
         args: [--all]
 
   - repo: https://github.com/MarcoGorelli/absolufy-imports
